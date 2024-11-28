@@ -1,48 +1,50 @@
 const express = require('express')
+const cors = require('cors')
 const { v4: uuidv4 } = require('uuid')
 const { stringToHex, chunkToUtf8String } = require('./utils.js')
 require('dotenv').config()
 const app = express()
 
 // 中间件配置
+app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
 app.post('/v1/chat/completions', async (req, res) => {
-  // o1开头的模型，不支持流式输出
-  if (req.body.model.startsWith('o1-') && req.body.stream) {
-    return res.status(400).json({
-      error: 'Model not supported stream'
-    })
-  }
+  console.log('收到请求:', {
+    model: req.body.model,
+    messages: req.body.messages,
+    stream: req.body.stream,
+    headers: req.headers
+  })
 
   let currentKeyIndex = 0
   try {
     const { model, messages, stream = false } = req.body
     let authToken = req.headers.authorization?.replace('Bearer ', '')
-    // 处理逗号分隔的密钥
+    
+    console.log('处理前的Token:', authToken)
+    
     const keys = authToken.split(',').map(key => key.trim())
     if (keys.length > 0) {
-      // 确保 currentKeyIndex 不会越界
-      if (currentKeyIndex >= keys.length) {
-        currentKeyIndex = 0
-      }
-      // 使用当前索引获取密钥
       authToken = keys[currentKeyIndex]
-      // 更新索引
       currentKeyIndex = (currentKeyIndex + 1)
+      console.log('处理后的Token:', authToken)
     }
+
     if (authToken && authToken.includes('%3A%3A')) {
       authToken = authToken.split('%3A%3A')[1]
-    }
-    if (!messages || !Array.isArray(messages) || messages.length === 0 || !authToken) {
-      return res.status(400).json({
-        error: 'Invalid request. Messages should be a non-empty array and authorization is required'
-      })
+      console.log('最终使用的Token:', authToken)
     }
 
     const formattedMessages = messages.map(msg => `${msg.role}:${msg.content}`).join('\n')
     const hexData = stringToHex(formattedMessages, model)
+    
+    console.log('准备发送请求到Cursor API:', {
+      formattedMessages,
+      model,
+      stream
+    })
 
     const response = await fetch('https://api2.cursor.sh/aiserver.v1.AiService/StreamChat', {
       method: 'POST',
@@ -63,33 +65,50 @@ app.post('/v1/chat/completions', async (req, res) => {
       body: hexData
     })
 
+    console.log('Cursor API 响应:', {
+      status: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers)
+    })
+
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
 
       const responseId = `chatcmpl-${uuidv4()}`
+      let isFirstChunk = true
 
-      // 使用封装的函数处理 chunk
       for await (const chunk of response.body) {
         const text = chunkToUtf8String(chunk)
+        let cleanedText = text
+        // .replace(/[\u0000-\u0009\u000B\u000C\u000E-\u001F]/g, '').trim()
 
-        if (text.length > 0) {
-          res.write(`data: ${JSON.stringify({
-                        id: responseId,
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model,
-                        choices: [{
-                            index: 0,
-                            delta: {
-                                content: text
-                            }
-                        }]
-                    })}\n\n`)
+        // if (isFirstChunk) {
+        //   cleanedText = cleanedText.replace(/^P/, '')
+        //   isFirstChunk = false
+        // }
+
+        // console.log('收到流式数据(清理后):', cleanedText)
+
+        if (cleanedText.length > 0) {
+          const eventData = JSON.stringify({
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{
+              index: 0,
+              delta: {
+                content: cleanedText
+              }
+            }]
+          })
+          res.write(`data: ${eventData}\n\n`)
         }
       }
 
+      console.log('流式响应完成')
       res.write('data: [DONE]\n\n')
       return res.end()
     } else {
@@ -124,13 +143,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       })
     }
   } catch (error) {
-    console.error('Error:', error)
+    console.error('详细错误信息:', error)
+    console.error('错误堆栈:', error.stack)
     if (!res.headersSent) {
       if (req.body.stream) {
-        res.write(`data: ${JSON.stringify({ error: 'Internal server error' })}\n\n`)
+        const errorResponse = JSON.stringify({ error: 'Internal server error', details: error.message })
+        console.log('发送错误响应:', errorResponse)
+        res.write(`data: ${errorResponse}\n\n`)
         return res.end()
       } else {
-        return res.status(500).json({ error: 'Internal server error' })
+        return res.status(500).json({ error: 'Internal server error', details: error.message })
       }
     }
   }
